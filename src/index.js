@@ -1,139 +1,78 @@
-const mongoose = require('mongoose');
-const http = require('http');
-const { Server } = require('socket.io');
-const app = require('./app');
+const express = require('express');
+const helmet = require('helmet');
+const xss = require('xss-clean');
+const mongoSanitize = require('express-mongo-sanitize');
+const compression = require('compression');
+const cors = require('cors');
+const passport = require('passport');
+const httpStatus = require('http-status');
 const config = require('./config/config');
-const logger = require('./config/logger');
-const ChatService = require('./services/chat.service'); // New service for chat logic
+const morgan = require('./config/morgan');
+const { jwtStrategy } = require('./config/passport');
+const { authLimiter } = require('./middlewares/rateLimiter');
+const routes = require('./routes/v1');
+const { errorConverter, errorHandler } = require('./middlewares/error');
+const ApiError = require('./utils/ApiError');
 
-let server;
-global.__databaseMongo;
+const app = express();
+global.__basedir = __dirname;
+app.use(express.static('public'));
 
-// Create HTTP server
-const httpServer = http.createServer(app);
+if (config.env !== 'test') {
+  app.use(morgan.successHandler);
+  app.use(morgan.errorHandler);
+}
 
-// Initialize Socket.IO
-const io = new Server(httpServer, {
-  cors: {
-    origin: '*', // Configured allowed origins
-    methods: ['GET', 'POST','PUT', 'DELETE','PATCH'], // Configured allowed methods
-  },
+// set security HTTP headers
+app.use(helmet());
+
+// parse json request body
+app.use(express.json());
+
+// parse urlencoded request body
+app.use(express.urlencoded({ extended: true }));
+
+// sanitize request data
+app.use(xss());
+app.use(mongoSanitize());
+
+// gzip compression
+app.use(compression());
+
+// enable cors
+app.use(cors());
+app.options('*', cors());
+
+// jwt authentication
+app.use(passport.initialize());
+passport.use('jwt', jwtStrategy);
+
+// limit repeated failed requests to auth endpoints
+if (config.env === 'production') {
+  app.use('/v1/auth', authLimiter);
+}
+
+app.use((req, res, next) => {
+  console.log(`${req.method} ${req.originalUrl}`);
+  next();
 });
-mongoose.set('useFindAndModify', false); // Disable deprecated findAndModify warnings
+// v1 api routes
+app.use('/v1', routes);
 
-// Establish MongoDB connection
-mongoose.connect(config.mongoose.url, config.mongoose.options).then(() => {
-  logger.info('Connected to MongoDB');
-  __databaseMongo = mongoose.connection.db;
 
-  // Start HTTP server
-  server = httpServer.listen(config.port, () => {
-    logger.info(`Listening to port ${config.port}`);
-  });
+
+app.get('/', (req, res) => {
+  res.send('Welcome! Backend Music App Running Normaly.');
+});
+// send back a 404 error for any unknown api request
+app.use((req, res, next) => {
+  next(new ApiError(httpStatus.NOT_FOUND, 'Not found'));
 });
 
-// Active users map (consider replacing with Redis for scalability)
-const activeUsers = new Map();
+// convert error to ApiError, if needed
+app.use(errorConverter);
 
-// Socket.IO configuration
-io.on('connection', (socket) => {
-  console.log('User connected:', socket.id);
+// handle error
+app.use(errorHandler);
 
-  // Handle user joining
-  socket.on('join', async ({ userId }, callback = () => {}) => {
-    try {
-      if (!userId) {
-        return callback({ success: false, message: 'User ID is required' });
-      }
-
-      activeUsers.set(userId, socket.id);
-      console.log(`User ${userId} joined with socket ID ${socket.id}`);
-      callback({ success: true });
-    } catch (error) {
-      logger.error('Error in join event:', error);
-      callback({ success: false, message: 'Error joining chat' });
-    }
-  });
-
-  // Handle sending messages
-  socket.on('sendMessage', async ({ senderId, recipientId, message }, callback = () => {}) => {
-    try {
-      if (!message.trim()) {
-        return callback({ success: false, message: 'Message cannot be empty' });
-      }
-
-      const chat = await ChatService.saveMessage(senderId, recipientId, message);
-
-      // Emit the message to the recipient if online
-      const recipientSocketId = activeUsers.get(recipientId);
-      if (recipientSocketId) {
-        io.to(recipientSocketId).emit('receiveMessage', { senderId, message });
-      }
-
-      callback({ success: true, chat });
-    } catch (error) {
-      logger.error('Error sending message:', error);
-      callback({ success: false, message: 'Error sending message' });
-    }
-  });
-
-  // Handle blocking user
-  socket.on('blockUser', async ({ userId, blockedUserId }, callback = () => {}) => {
-    try {
-      await ChatService.blockUser(userId, blockedUserId);
-      const blockedSocketId = activeUsers.get(blockedUserId);
-
-      if (blockedSocketId) {
-        io.to(blockedSocketId).emit('userBlocked', {
-          message: `You have been blocked by User ${userId}`,
-        });
-      }
-
-      callback({ success: true, message: `User ${blockedUserId} has been blocked.` });
-    } catch (error) {
-      logger.error('Error blocking user:', error);
-      callback({ success: false, message: 'Error blocking user' });
-    }
-  });
-
-  // Handle reporting user
-  socket.on('reportUser', async ({ userId, reportedUserId }, callback = () => {}) => {
-    try {
-      await ChatService.reportUser(userId, reportedUserId);
-      callback({ success: true, message: `User ${reportedUserId} has been reported.` });
-    } catch (error) {
-      logger.error('Error reporting user:', error);
-      callback({ success: false, message: 'Error reporting user' });
-    }
-  });
-
-  // Handle typing indicator
-  socket.on('typing', ({ senderId, recipientId }) => {
-    const recipientSocketId = activeUsers.get(recipientId);
-    if (recipientSocketId) {
-      io.to(recipientSocketId).emit('userTyping', { senderId });
-    }
-  });
-
-  // Handle read receipt
-  socket.on('markAsRead', async ({ userId, chatId }, callback = () => {}) => {
-    try {
-      await ChatService.markMessagesAsRead(chatId, userId);
-      callback({ success: true });
-    } catch (error) {
-      logger.error('Error marking messages as read:', error);
-      callback({ success: false });
-    }
-  });
-
-  // Handle user disconnect
-  socket.on('disconnect', () => {
-    console.log('User disconnected:', socket.id);
-    for (const [userId, socketId] of activeUsers.entries()) {
-      if (socketId === socket.id) {
-        activeUsers.delete(userId);
-        break;
-      }
-    }
-  });
-});
+module.exports = app;
